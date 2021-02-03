@@ -10,7 +10,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import Input, Model, Sequential
 import tensorflow.keras.backend as K
-from tensorflow.keras.layers import *
+from tensorflow.keras.layers import Conv2D, Dense, Flatten, Layer
 tf.compat.v1.disable_eager_execution() # 关闭动态图机制
 
 def process_frame(frame, height, width):
@@ -151,6 +151,159 @@ class MultipleEnvironments():
             conn.close()
         for conn in self.env_conns:
             conn.close()
+
+
+class Memory():
+    def __init__(self):
+        self.reset()
+    
+    def store(self, state, action, prob, reward, next_state, done):
+        ### 逆序插入方便之后计算GAE
+        self.states.insert(0, state) 
+        self.actions.insert(0, action)
+        self.probs.insert(0, prob)
+        self.rewards.insert(0, reward)
+        self.next_states.insert(0, next_state)
+        self.dones.insert(0, done)
+        
+    def reset(self):
+        self.states = []
+        self.actions = []
+        self.probs = []
+        self.rewards = []
+        self.next_states = []
+        self.dones = []
+
+        
+class Feature(Layer):
+    def __init__(self):
+        super().__init__()
+        self.model = Sequential([
+            Conv2D(32, 3, strides=2, activation='relu', padding='same'),
+            Conv2D(32, 3, strides=2, activation='relu', padding='same'),
+            Conv2D(32, 3, strides=2, activation='relu', padding='same'),
+            Conv2D(32, 3, strides=2, activation='relu', padding='same'),
+            Flatten(),
+            Dense(512, activation='relu'),
+        ])
+        
+    def call(self, x):
+        return self.model(x)
+
+    
+class PPOTrainer():
+    def __init__(
+        self, 
+        obs_shape, 
+        act_n, 
+        lmbda=0.97, 
+        gamma=0.99, 
+        lr=2e-4, 
+        eps_clip=0.2,
+        train_step=10,
+        entropy_coef=0.05,
+        checkpoint_path='mario',
+    ):
+        self.memory = Memory()
+        self.lmbda = lmbda
+        self.gamma = gamma 
+        self.lr = lr
+        self.obs_shape = obs_shape
+        self.act_n = act_n
+        self.eps_clip = eps_clip
+        self.train_step = train_step
+        self.entropy_coef = entropy_coef
+        self.policy, self.value, self.train_model = self.build_model()
+        print(1)
+        ckpt = tf.train.Checkpoint(
+            train_model=self.train_model,
+            optimizer=self.train_model.optimizer,
+        )
+        self.ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=1) 
+        
+    def build_model(self):
+        s_input = Input(self.obs_shape)
+        prob_old_input = Input([])
+        action_old_input = Input([], dtype='int32')
+        gae_input = Input([])
+        v_target_input = Input([])
+        
+        feature = Feature()
+        x = feature(s_input)
+        policy_dense = Dense(self.act_n, activation='softmax')
+        value_dense = Dense(1)
+        prob = policy_dense(x)
+        v = value_dense(x)
+        policy = Model(inputs=s_input, outputs=prob)
+        value = Model(inputs=s_input, outputs=v)
+
+        prob_cur = tf.gather(prob, action_old_input, batch_dims=1)
+        ratio = prob_cur / (prob_old_input + 1e-3)
+        surr1 = ratio * gae_input
+        surr2 = K.clip(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * gae_input
+        
+        # 第二项为熵值计算，由于已经按照动作概率采样，因此计算时不再乘上概率，并且只需要计算当前动作概率的对数
+        policy_loss = -K.mean(K.minimum(surr1, surr2)) + K.mean(K.log(prob_cur + 1e-3)) * self.entropy_coef 
+        
+        value_loss = K.mean((v[:, 0] - v_target_input) ** 2)
+        loss = policy_loss + value_loss
+        train_model = Model(inputs=[s_input, prob_old_input, action_old_input, gae_input, v_target_input], outputs=loss)
+        train_model.add_loss(loss)
+        train_model.compile(tf.keras.optimizers.Adam(self.lr))
+        return policy, value, train_model
+    
+    def choose_action(self, states):
+        # states.shape: (env_num, height, width, skip_frames) 
+        probs = self.policy.predict(states) # shape: (env_num, act_n)
+        actions = [np.random.choice(range(self.act_n), p=prob) for prob in probs] # shape: (env_num)
+        return actions, probs[np.arange(len(probs)), actions]
+
+    def store(self, states, actions, probs, rewards, next_states, dones):
+        self.memory.store(states, actions, probs, rewards, next_states, dones)
+           
+    def update_model(self, batch_size=128):
+        states = np.array(self.memory.states) # shape: (-1, env_num, height, width, skip_frames)
+        actions = np.array(self.memory.actions) # shape: (-1, env_num)
+        probs = np.array(self.memory.probs) # shape: (-1, env_num)
+        rewards = np.array(self.memory.rewards) # shape: (-1, env_num)
+        next_states = np.array(self.memory.next_states) # shape: (-1, env_num, height, width, skip_frames)
+        dones = np.array(self.memory.dones) # shape: (-1, env_num)
+        
+        env_num = states.shape[1]
+        states = states.reshape([-1, *states.shape[2:]])
+        next_states = next_states.reshape([-1, *next_states.shape[2:]])
+        actions = actions.flatten()
+        probs = probs.flatten()
+        
+        for step in range(self.train_step):
+            v = self.value.predict(states, batch_size=batch_size)
+            v_next = self.value.predict(next_states, batch_size=batch_size)
+            v = v.reshape([v.shape[0] // env_num, env_num])
+            v_next = v_next.reshape([v_next.shape[0] // env_num, env_num])
+            
+            v_target = rewards + self.gamma * v_next * ~dones
+            td_errors = v_target - v
+            gae_lst = []
+            adv = 0
+            for delta in td_errors:
+                adv = self.gamma * self.lmbda * adv + delta
+                gae_lst.append(adv)
+            
+            gaes = np.array(gae_lst)
+            gaes = gaes.flatten()
+            v_target = v_target.flatten()
+            self.train_model.fit([states, probs, actions, gaes, v_target], batch_size=batch_size)
+
+        self.memory.reset()
+        
+    def save(self):
+        self.ckpt_manager.save()
+        
+    def load(self):     
+        if self.ckpt_manager.latest_checkpoint:
+            status = agent.ckpt_manager.checkpoint.restore(self.ckpt_manager.latest_checkpoint)
+            status.run_restore_ops() # 关闭动态图后需要添加这句执行restore操作
+
 
 
 if __name__ == '__main__': # multiprocessing 创建的进程会导入该文件而不会执行以下操作
