@@ -123,29 +123,29 @@ class MultipleEnvironments():
     def __getattr__(self, name):
         if name in self.__dict__:
             return self.__dict__[name]
-        assert not env.agent_conns[0].closed, 'Environment closed.'
+        assert not self.agent_conns[0].closed, 'Environment closed.'
         self.agent_conns[0].send([name, None])
         return self.agent_conns[0].recv()
                 
     def step(self, actions):
-        assert not env.agent_conns[0].closed, 'Environment closed.'
+        assert not self.agent_conns[0].closed, 'Environment closed.'
         for conn, action in zip(self.agent_conns, actions):
             conn.send(['step', action.item()])
         return tuple(zip(*[conn.recv() for conn in self.agent_conns]))
     
     def reset(self):
-        assert not env.agent_conns[0].closed, 'Environment closed.'
+        assert not self.agent_conns[0].closed, 'Environment closed.'
         for conn in self.agent_conns:
             conn.send(['reset', None])
         return tuple(conn.recv() for conn in self.agent_conns)
     
     def render(self):
-        assert not env.agent_conns[0].closed, 'Environment closed.'
+        assert not self.agent_conns[0].closed, 'Environment closed.'
         for conn in self.agent_conns:
             conn.send(['render', None])
                 
     def close(self):
-        assert not env.agent_conns[0].closed, 'Environment closed.'
+        assert not self.agent_conns[0].closed, 'Environment closed.'
         for conn in self.agent_conns:
             conn.send(['close', None])
             conn.close()
